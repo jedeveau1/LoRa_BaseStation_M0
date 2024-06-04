@@ -1,6 +1,7 @@
-// v1.1 - first fielded version
-// v1.2 - Changed SF = 10
-// v1.3 - Changed for SN#2 and beyond - fixed color bitmap
+// [v1.1] - first fielded version
+// [v1.2] - Changed SF = 10
+// [v1.3] - 1/31/22 - Changed for SN#2 and beyond - fixed color bitmap
+// [v1.35] - 1/4/23 - add version info and fix bug for basestation GPS not updating without remote GPS update
 
 #include <FlashAsEEPROM.h>
 
@@ -11,6 +12,9 @@
 #include <RH_RF95.h>
 #include <QMC5883LCompass.h>
 #include <Button.h>
+
+// BS_VERSION - Basestation Version string
+static const char* BS_VERSION = "v1.35";
 
 // for Feather32u4 RFM9x
 //#define RFM95_CS 8
@@ -145,8 +149,14 @@ void setup() {
 #ifdef COMPASS
   //init compass
   compass.init();
-  //compass.setCalibration(-336, 1190, -1160, 352, -1322, 0);   // SN #1
-  compass.setCalibration(-686, 797, -1171, 267, -1237, 0);    // SN #2
+  //compass.setCalibration(-336, 1190, -1160, 352, -1322, 0);   // SN #1 (me)
+  //compass.setCalibration(-686, 797, -1171, 267, -1237, 0);    // SN #2 (Paul)
+  //compass.setCalibration(-498, 1013, -1135, 355, -1242, 0);    // SN #3 (Dave)
+  //compass.setCalibration(-713, 2007, -1826, 968, -1460, 0);    // SN #4 (Val)
+  //compass.setCalibration(-942, 377, -1101, 280, -1227, 0);     // SN #5 (Mike M)  
+  //compass.setCalibration(-797, 603, -1041, 372, -1155, 0);    // SN #6 (Ron R)
+  compass.setCalibration(-1073, 352, -892, 536, -1133, 0);    // SN #7 (Jim M)
+
 
 #endif
 
@@ -157,6 +167,7 @@ void setup() {
 #ifdef LCD_DISPLAY
  // Use this initializer if using a 1.8" TFT screen:
   tft.initR(INITR_BLACKTAB);      // Init ST7735S chip, black tab
+  tft.invertDisplay(true);  // include this if the display is inverted
 
 #endif
 
@@ -239,6 +250,9 @@ void setup() {
   tft.setTextColor(ST77XX_CYAN);
   tft.setTextSize(1);
   tft.setCursor(0, 30);
+  tft.print("Version ");
+  tft.print(BS_VERSION);
+  tft.setCursor(0, 50);
   tft.println("Waiting for GPS...");
   tft.print("...on Channel ");
   tft.print(radio_channel);
@@ -366,7 +380,7 @@ void loop() {
 #endif
       // Now update display
       smartDelay(500, 1);
-      if(gps.sentencesWithFix()){
+      if(gpsBS.sentencesWithFix()){ //[v1.35]
          updatedGPSFix = true;   // update loop indicator that we've had a new GPS fix
       }
     }
