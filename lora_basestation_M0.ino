@@ -1,7 +1,7 @@
-// [v1.1] - first fielded version
-// [v1.2] - Changed SF = 10
-// [v1.3] - 1/31/22 - Changed for SN#2 and beyond - fixed color bitmap
-// [v1.35] - 1/4/23 - add version info and fix bug for basestation GPS not updating without remote GPS update
+// v1.1 - first fielded version
+// v1.2 - Changed SF = 10
+// v1.3 - Changed for SN#2 and beyond - fixed color bitmap/
+// v1.4 - Added saving last known good position, version display, etc.
 
 #include <FlashAsEEPROM.h>
 
@@ -12,9 +12,6 @@
 #include <RH_RF95.h>
 #include <QMC5883LCompass.h>
 #include <Button.h>
-
-// BS_VERSION - Basestation Version string
-static const char* BS_VERSION = "v1.35";
 
 // for Feather32u4 RFM9x
 //#define RFM95_CS 8
@@ -34,9 +31,20 @@ static const char* BS_VERSION = "v1.35";
 
 #define SN_NO_1 0 // SN #1 has different display bitmap
 
+const char version_str[] = {"Version: 1.4"};
+
 // The TinyGPS++ object
 TinyGPSPlus gps;
 TinyGPSPlus gpsBS;   //basestation local GPS object
+
+// last known good Remote Lat/long [v1.4]
+typedef struct
+{
+  double Lat;
+  double Long;
+} GPS_Pos_struct;
+
+GPS_Pos_struct  LKG_Position;
 
 typedef struct {
   uint8_t x0;
@@ -110,7 +118,18 @@ Button button = Button(A5,PULLUP);
 #define RF95_FREQ_6 911.9
 #define RF95_FREQ_7 913.5
 
+// Flash location definition struct [v1.4]
+typedef struct {
+  uint8_t ChanID;
+  double lkg_Lat;
+  double lkg_Long;
+} Flash_struct;
+
+Flash_struct  FlashData;
+
+
 float RF95_FREQ;
+
 
 // Singleton instance of the radio driver
 RH_RF95 rf95(RFM95_CS, RFM95_INT);
@@ -149,14 +168,8 @@ void setup() {
 #ifdef COMPASS
   //init compass
   compass.init();
-  //compass.setCalibration(-336, 1190, -1160, 352, -1322, 0);   // SN #1 (me)
-  //compass.setCalibration(-686, 797, -1171, 267, -1237, 0);    // SN #2 (Paul)
-  //compass.setCalibration(-498, 1013, -1135, 355, -1242, 0);    // SN #3 (Dave)
-  //compass.setCalibration(-713, 2007, -1826, 968, -1460, 0);    // SN #4 (Val)
-  //compass.setCalibration(-942, 377, -1101, 280, -1227, 0);     // SN #5 (Mike M)  
-  //compass.setCalibration(-797, 603, -1041, 372, -1155, 0);    // SN #6 (Ron R)
-  compass.setCalibration(-1073, 352, -892, 536, -1133, 0);    // SN #7 (Jim M)
-
+  //compass.setCalibration(-336, 1190, -1160, 352, -1322, 0);   // SN #1
+  compass.setCalibration(-686, 797, -1171, 267, -1237, 0);    // SN #2
 
 #endif
 
@@ -167,9 +180,14 @@ void setup() {
 #ifdef LCD_DISPLAY
  // Use this initializer if using a 1.8" TFT screen:
   tft.initR(INITR_BLACKTAB);      // Init ST7735S chip, black tab
-  tft.invertDisplay(true);  // include this if the display is inverted
 
 #endif
+
+  // get the data stored in flash [v1.4]
+  getFlashData(&FlashData);
+
+  LKG_Position.Lat = FlashData.lkg_Lat;
+  LKG_Position.Long = FlashData.lkg_Long;
 
   // Provide user opportunity to change the radio channel
   radio_channel = getRadioChannel();
@@ -250,13 +268,12 @@ void setup() {
   tft.setTextColor(ST77XX_CYAN);
   tft.setTextSize(1);
   tft.setCursor(0, 30);
-  tft.print("Version ");
-  tft.print(BS_VERSION);
-  tft.setCursor(0, 50);
+  tft.println(version_str); //[1.4]
   tft.println("Waiting for GPS...");
   tft.print("...on Channel ");
   tft.print(radio_channel);
 #endif
+
 
   delay(2000);
  
@@ -285,6 +302,10 @@ void loop() {
      tft.fillScreen(ST77XX_BLACK);   // clear display
 #endif
      updatedGPSFix = true;  // trick later display update so that we can get a new display even if GPS doesn't update
+     // Use button push to write last known position to flash
+     FlashData.lkg_Lat = LKG_Position.Lat;
+     FlashData.lkg_Long = LKG_Position.Long;
+     UpdateFlashData(&FlashData);
   }
 
   //////////////////////////////////////////////
@@ -332,6 +353,11 @@ void loop() {
 
     if(gps.sentencesWithFix()){
       updatedGPSFix = true;   // update loop indicator that we've had a new GPS fix
+      
+      // update LKG position [v1.4]
+      LKG_Position.Lat = gps.location.lat();
+      LKG_Position.Long = gps.location.lng();
+      
       digitalWrite(LED, LOW);
     } 
   } 
@@ -380,7 +406,7 @@ void loop() {
 #endif
       // Now update display
       smartDelay(500, 1);
-      if(gpsBS.sentencesWithFix()){ //[v1.35]
+      if(gpsBS.sentencesWithFix()){
          updatedGPSFix = true;   // update loop indicator that we've had a new GPS fix
       }
     }
@@ -403,7 +429,7 @@ void loop() {
     }
     //delay(500);
 #ifdef LCD_DISPLAY
-    updateDisplay(display_mode);  // new remote GPS update, update display
+    updateDisplay(display_mode);  // new GPS update, update display
 #endif
     updatedGPSFix = false;
   }
@@ -441,18 +467,20 @@ static void updateDisplay(int display)
       tft.setTextColor(ST77XX_WHITE, ST77XX_BLACK);
       tft.setTextSize(2);
       tft.setCursor(0,10);
-//      tft.print("N ");
-      tft.print(pGPS->location.lat(),6);   // print or println?
-      tft.setCursor(0,30);   // how far to move cursor?
-//      tft.print("W ");
-      tft.print(pGPS->location.lng(),6);
-      tft.setCursor(0,50);   // how far to move cursor?
       if(display == RADIO_GPS_MENU)
       {
+        tft.print(LKG_Position.Lat,6);   // print or println?
+        tft.setCursor(0,30);   // how far to move cursor?
+        tft.print(LKG_Position.Long,6);
+        tft.setCursor(0,50);   // how far to move cursor?
         tft.print("ALT: ");
         tft.print(pGPS->altitude.meters()*METERS_2_FEET,0);
       }
       else {  
+        tft.print(pGPS->location.lat(),6);   // print or println?
+        tft.setCursor(0,30);   // how far to move cursor?
+        tft.print(pGPS->location.lng(),6);
+        tft.setCursor(0,50);   // how far to move cursor?
         tft.print("Compass: ");
         tft.print(heading);
       }
@@ -490,8 +518,10 @@ static void updateDisplay(int display)
     } 
     else    // If we got here, display must be tracker.  Process the tracker mode
     {
-     distanceInMeters = (int) gps.distanceBetween(gpsBS.location.lat(), gpsBS.location.lng(), gps.location.lat(), gps.location.lng());
-     courseToTarget = (int) gps.courseTo(gpsBS.location.lat(), gpsBS.location.lng(),gps.location.lat(), gps.location.lng());
+     // use last known good position from Remote GPS.  If it hasn't been updated since power-on, then it came from flash [v1.4]
+     
+     distanceInMeters = (int) gps.distanceBetween(gpsBS.location.lat(), gpsBS.location.lng(), LKG_Position.Lat, LKG_Position.Long);
+     courseToTarget = (int) gps.courseTo(gpsBS.location.lat(), gpsBS.location.lng(),LKG_Position.Lat, LKG_Position.Long);
 	
 	// check for uninitialized/out of bounds distances
 	if(distanceInMeters > 99999.0)
@@ -641,11 +671,9 @@ static int getRadioChannel(void)
   int TimerCnt = 10; // 10 times with 500 msec delay = 5 secs
 
   // First, get radio_channel from flash
-   if (EEPROM.isValid()) {
-      radio_channel = (int) EEPROM.read(0); // read first location for channel
-      if(radio_channel > 7)
-        radio_channel = 0;  // only 8 channels, if we read higher, set to zero
-   }
+  radio_channel = (int) FlashData.ChanID; // [v.14]
+  if(radio_channel > 7)
+    radio_channel = 0;  // only 8 channels, if we read higher, set to zero
 
   // Loop for 5 secs and wait for button hit.  For each button hit
   
@@ -671,11 +699,53 @@ static int getRadioChannel(void)
         tft.println(radio_channel);
         TimerCnt = 10;
         // Write the new value into flash
-        EEPROM.write(0, (uint8_t) radio_channel);
-        EEPROM.commit();
+        FlashData.ChanID = (uint8_t) radio_channel; // [v.14]
+        UpdateFlashData(&FlashData);
+        //EEPROM.write(0, (uint8_t) radio_channel);
+        //EEPROM.commit();
         tft.println("Channel Updated");
       }
       delay(500);
   }
   return radio_channel;
+}
+
+
+
+static void getFlashData(Flash_struct *FlashData)
+{
+  uint8_t   *ptr;
+  int i;
+  
+  if (EEPROM.isValid()) {
+    // read whole struct out in serial fashion
+    ptr = (uint8_t *) FlashData;
+    for(i=0;i<sizeof(Flash_struct);i++)
+    {
+      *ptr++ = (int) EEPROM.read(i); // read each byte
+    
+    }
+  }
+  else  // if flash isn't valid, then zero everything out
+  {
+    FlashData->ChanID = 0;
+    FlashData->lkg_Lat = 0.0;
+    FlashData->lkg_Long = 0.0;
+  }
+}
+
+static void UpdateFlashData(Flash_struct *FlashData)
+{
+  uint8_t  *ptr;
+  int i;
+ 
+  if (EEPROM.isValid()) {
+    // read whole struct out in serial fashion
+    ptr = (uint8_t *) &FlashData;
+    for(i=0;i<sizeof(Flash_struct);i++)
+    {
+      EEPROM.write(i, *ptr++);
+    }
+    EEPROM.commit();
+  }
 }
