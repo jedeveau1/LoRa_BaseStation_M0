@@ -2,6 +2,7 @@
 // [v1.2] - Changed SF = 10
 // [v1.3] - 1/31/22 - Changed for SN#2 and beyond - fixed color bitmap
 // [v1.35] - 1/4/23 - add version info and fix bug for basestation GPS not updating without remote GPS update
+// [v2.0] - 10/24/23 - Add last known good position saving capability, and expand # of channels to 15
 
 #include <FlashAsEEPROM.h>
 
@@ -14,7 +15,7 @@
 #include <Button.h>
 
 // BS_VERSION - Basestation Version string
-static const char* BS_VERSION = "v1.35";
+static const char* BS_VERSION = "v2.0";
 
 // for Feather32u4 RFM9x
 //#define RFM95_CS 8
@@ -37,6 +38,27 @@ static const char* BS_VERSION = "v1.35";
 // The TinyGPS++ object
 TinyGPSPlus gps;
 TinyGPSPlus gpsBS;   //basestation local GPS object
+
+// last known good Remote Lat/long [v2.0]
+typedef struct
+{
+  double Lat;
+  double Long;
+  double Alt;
+  bool isLKG; // if true, this is the value position read from flash and no updates from remote have happened
+} GPS_Pos_struct;
+
+GPS_Pos_struct  LKG_Position;
+
+// Flash location definition struct [v1.4]
+typedef struct {
+  uint8_t ChanID;
+  double lkg_Lat;
+  double lkg_Long;
+  double lkg_Alt;
+} Flash_struct;
+
+Flash_struct  FlashData;
 
 typedef struct {
   uint8_t x0;
@@ -70,7 +92,11 @@ static const Tracker_struct Tracker_icon[NUM_POINTS] = {{80,1,76,13,85,13},  //0
 {40,16,43,29,51,22},
 {58,5,58,18,68,15}};  // 340
 
-    
+// LKG indicator color array
+#define LKG_COLORS  4
+int LKG_Display[LKG_COLORS] = {ST77XX_CYAN, ST77XX_GREEN, ST77XX_MAGENTA, ST77XX_YELLOW};
+int LKG_indicator = 0;
+
 int displayIndex = 0;
 
 // These pins will also work for the 1.8" TFT shield.
@@ -109,8 +135,19 @@ Button button = Button(A5,PULLUP);
 #define RF95_FREQ_5 910.3
 #define RF95_FREQ_6 911.9
 #define RF95_FREQ_7 913.5
+#define RF95_FREQ_8 903.1
+#define RF95_FREQ_9 904.7
+#define RF95_FREQ_10 906.3
+#define RF95_FREQ_11 907.9
+#define RF95_FREQ_12 909.5
+#define RF95_FREQ_13 911.1
+#define RF95_FREQ_14 912.7
 
 float RF95_FREQ;
+
+#define MAX_OP_CHAN 14  
+
+#define LKG_WRITE_MSEC  60000 // write LKG position every minute (60,000 millisecs)
 
 // Singleton instance of the radio driver
 RH_RF95 rf95(RFM95_CS, RFM95_INT);
@@ -126,6 +163,9 @@ int radio_channel;
 
 //max altitude indicator
 int max_altitude = 0;
+unsigned long LKG_Counter;
+
+// SETUP - main Initialization
 
 void setup() {
   pinMode(LED, OUTPUT);
@@ -153,10 +193,7 @@ void setup() {
   //compass.setCalibration(-686, 797, -1171, 267, -1237, 0);    // SN #2 (Paul)
   //compass.setCalibration(-498, 1013, -1135, 355, -1242, 0);    // SN #3 (Dave)
   //compass.setCalibration(-713, 2007, -1826, 968, -1460, 0);    // SN #4 (Val)
-  //compass.setCalibration(-942, 377, -1101, 280, -1227, 0);     // SN #5 (Mike M)  
-  //compass.setCalibration(-797, 603, -1041, 372, -1155, 0);    // SN #6 (Ron R)
-  compass.setCalibration(-1073, 352, -892, 536, -1133, 0);    // SN #7 (Jim M)
-
+  compass.setCalibration(-942, 377, -1101, 280, -1227, 0);     // SN #5 (Mike M)
 
 #endif
 
@@ -167,16 +204,25 @@ void setup() {
 #ifdef LCD_DISPLAY
  // Use this initializer if using a 1.8" TFT screen:
   tft.initR(INITR_BLACKTAB);      // Init ST7735S chip, black tab
-  tft.invertDisplay(true);  // include this if the display is inverted
 
 #endif
+
+ // get the data stored in flash [v2.0]
+  getFlashData(&FlashData);
+
+  // initialize the last known good position stored in flash and set the isLKG flag to true for display updates
+  LKG_Position.Lat = FlashData.lkg_Lat;
+  LKG_Position.Long = FlashData.lkg_Long;
+  LKG_Position.Alt = FlashData.lkg_Alt;
+  LKG_Position.isLKG = true;
 
   // Provide user opportunity to change the radio channel
   radio_channel = getRadioChannel();
 
   Serial.print("Read Radio Chan: ");
   Serial.println(radio_channel);
-  
+
+// v2.0 - Expand number of channels
   switch(radio_channel){
     case 0:
 	    RF95_FREQ = RF95_FREQ_0;
@@ -202,6 +248,27 @@ void setup() {
     case 7:
 	    RF95_FREQ = RF95_FREQ_7;
 	    break;
+    case 8:
+      RF95_FREQ = RF95_FREQ_8;
+      break;
+    case 9:
+      RF95_FREQ = RF95_FREQ_9;
+      break;
+    case 10:
+      RF95_FREQ = RF95_FREQ_10;
+      break;
+    case 11:
+      RF95_FREQ = RF95_FREQ_11;
+      break;
+    case 12:
+      RF95_FREQ = RF95_FREQ_12;
+      break;
+    case 13:
+      RF95_FREQ = RF95_FREQ_13;
+      break;
+    case 14:
+      RF95_FREQ = RF95_FREQ_14;
+      break;
     default:
 	    RF95_FREQ = RF95_FREQ_0;
 	    break;
@@ -259,7 +326,9 @@ void setup() {
 #endif
 
   delay(2000);
- 
+   
+  // v2.0 init the LKG position flash write counter
+  LKG_Counter = millis() + LKG_WRITE_MSEC; 
 
 }
 
@@ -270,7 +339,14 @@ int display_mode = RADIO_GPS_MENU;
 int heading = 0;
 bool updatedGPSFix = false;
 int updateDisplayCnt = 0;
+int LKG_Write_Indicator = 0;
 
+// MAIN PROCESSING LOOP
+//  - Check button press
+//  - Check for messages from remote GPS
+//  - Check for message from local GPS
+//  - Read the compass
+//  - Call display update accordingly
 void loop() {
 
   ////////////////////////////////////////////
@@ -333,6 +409,9 @@ void loop() {
     if(gps.sentencesWithFix()){
       updatedGPSFix = true;   // update loop indicator that we've had a new GPS fix
       digitalWrite(LED, LOW);
+      // Reset the flash write watchdog because we are still getting updates
+      LKG_Counter = millis() + LKG_WRITE_MSEC;
+      LKG_Position.isLKG = false; // indicate we no longer need to use the stored value
     } 
   } 
 
@@ -381,7 +460,7 @@ void loop() {
       // Now update display
       smartDelay(500, 1);
       if(gpsBS.sentencesWithFix()){ //[v1.35]
-         updatedGPSFix = true;   // update loop indicator that we've had a new GPS fix
+         updatedGPSFix = true;   // update loop indicator that we've had a new local GPS fix
       }
     }
     inIndex = 0;
@@ -389,7 +468,7 @@ void loop() {
 #endif
 
   ////////////////////////////
-  //  Lastly, update the display if its time
+  //  Lastly, update the display if its time - for either remote or local GPS fix
 
   if(((++updateDisplayCnt % 2) == 0) && updatedGPSFix)// only update display on every other instance of update GPS fix
   {
@@ -408,6 +487,22 @@ void loop() {
     updatedGPSFix = false;
   }
  
+  // check if we have not gotten an update for the flash write timeout.  
+  // If we have not, write out the latest remote position.   Also make sure we had at least one update from remote, 
+  //.  we dont' want to save to flash if we are just powered up before getting for fix
+  if((((int32_t)(millis() - LKG_Counter)) > 0) && gps.sentencesWithFix())
+  {
+      // reset the watchdog
+      LKG_Counter = millis() + LKG_WRITE_MSEC; 
+        // now, write the last known good (LKG) position to flash
+      FlashData.lkg_Lat = gps.location.lat();
+      FlashData.lkg_Long = gps.location.lng();
+      FlashData.lkg_Alt = gps.altitude.meters();
+      UpdateFlashData(&FlashData);
+      if(++LKG_indicator >= LKG_COLORS)  // set Remote Display color as a cheap way to indicate that the flash has been written
+        LKG_indicator = 1;
+  }
+
 }
 
 
@@ -424,33 +519,62 @@ static void updateDisplay(int display)
 
     if(display != TRACKER_MENU)
     {
-      tft.setTextColor(ST77XX_CYAN, ST77XX_BLACK);
+      
       tft.setTextSize(1);
       
       if(display == RADIO_GPS_MENU)
       {
+        tft.setTextColor(LKG_Display[LKG_indicator], ST77XX_BLACK); // change Heading color every time LKG is written to flash
         tft.setCursor(60, 0);
         tft.print("Remote GPS");
         pGPS = &gps;
+        if(LKG_Position.isLKG ){ // if this is the position from flash, indicate with RED text
+          tft.setTextColor(ST77XX_RED, ST77XX_BLACK);
+        }
+        else { 
+          tft.setTextColor(ST77XX_WHITE, ST77XX_BLACK);
+        }
       }
       else {
+        tft.setTextColor(ST77XX_CYAN, ST77XX_BLACK);
         tft.setCursor(45, 0);  
         tft.print("Basestation Data");
         pGPS = &gpsBS;
+        tft.setTextColor(ST77XX_WHITE, ST77XX_BLACK);
       }
-      tft.setTextColor(ST77XX_WHITE, ST77XX_BLACK);
+      
       tft.setTextSize(2);
       tft.setCursor(0,10);
-//      tft.print("N ");
-      tft.print(pGPS->location.lat(),6);   // print or println?
+      // check if this is the remote display and we are displaying the LKG
+      if(LKG_Position.isLKG && (display == RADIO_GPS_MENU))
+      { 
+        tft.print(LKG_Position.Lat,6);
+      }
+      else {
+        tft.print(pGPS->location.lat(),6);   // print or println?
+      }
       tft.setCursor(0,30);   // how far to move cursor?
-//      tft.print("W ");
-      tft.print(pGPS->location.lng(),6);
+
+      if(LKG_Position.isLKG && (display == RADIO_GPS_MENU))
+      { 
+        tft.print(LKG_Position.Long,6);
+      }
+      else {
+        tft.print(pGPS->location.lng(),6);
+      }
+
       tft.setCursor(0,50);   // how far to move cursor?
       if(display == RADIO_GPS_MENU)
       {
         tft.print("ALT: ");
-        tft.print(pGPS->altitude.meters()*METERS_2_FEET,0);
+        if(LKG_Position.isLKG)
+        {
+          tft.print(LKG_Position.Alt*METERS_2_FEET,0);
+        }
+        else
+        {
+          tft.print(pGPS->altitude.meters()*METERS_2_FEET,0);
+        }
       }
       else {  
         tft.print("Compass: ");
@@ -635,17 +759,17 @@ static void printStr(const char *str, int len)
 }
 #endif
 
+
 // initial loop to allow selection of receiver channel
+//   Need to call getFlashData before calling this function
 static int getRadioChannel(void)
 {
   int TimerCnt = 10; // 10 times with 500 msec delay = 5 secs
 
   // First, get radio_channel from flash
-   if (EEPROM.isValid()) {
-      radio_channel = (int) EEPROM.read(0); // read first location for channel
-      if(radio_channel > 7)
-        radio_channel = 0;  // only 8 channels, if we read higher, set to zero
-   }
+  radio_channel = (int) FlashData.ChanID; // [v2.0]
+  if(radio_channel > MAX_OP_CHAN)
+    radio_channel = 0;  // only 15 channels, if we read higher, set to zero
 
   // Loop for 5 secs and wait for button hit.  For each button hit
   
@@ -665,17 +789,62 @@ static int getRadioChannel(void)
         tft.setTextColor(ST77XX_WHITE);
         tft.setTextSize(1);
         tft.setCursor(0, 30);
-        if(radio_channel++ >= 7)
+        if(radio_channel++ >= MAX_OP_CHAN)
           radio_channel = 0;
         tft.print("Channel = ");
         tft.println(radio_channel);
         TimerCnt = 10;
         // Write the new value into flash
-        EEPROM.write(0, (uint8_t) radio_channel);
-        EEPROM.commit();
+        FlashData.ChanID = (uint8_t) radio_channel; // [v.14]
+        UpdateFlashData(&FlashData);
+        //EEPROM.write(0, (uint8_t) radio_channel);
+        //EEPROM.commit();
         tft.println("Channel Updated");
       }
       delay(500);
   }
   return radio_channel;
+}
+
+
+// Get data from flash.  Gets all of the data, not just one parameter
+
+static void getFlashData(Flash_struct *FlashData)
+{
+  uint8_t   *ptr;
+  int i;
+  
+  if (EEPROM.isValid()) {
+    // read whole struct out in serial fashion
+    ptr = (uint8_t *) FlashData;
+    for(i=0;i<sizeof(Flash_struct);i++)
+    {
+      *ptr++ = (int) EEPROM.read(i); // read each byte
+    
+    }
+  }
+  else  // if flash isn't valid, then zero everything out
+  {
+    FlashData->ChanID = 0;
+    FlashData->lkg_Lat = 0.0;
+    FlashData->lkg_Long = 0.0;
+    FlashData->lkg_Alt = 0.0;
+  }
+}
+
+// Write data to flash.  Writes the whole flash struct, not just one parameter
+static void UpdateFlashData(Flash_struct *FlashData)
+{
+  uint8_t  *ptr;
+  int i;
+ 
+  if (EEPROM.isValid()) {
+    // read whole struct out in serial fashion
+    ptr = (uint8_t *) &FlashData;
+    for(i=0;i<sizeof(Flash_struct);i++)
+    {
+      EEPROM.write(i, *ptr++);
+    }
+    EEPROM.commit();
+  }
 }
