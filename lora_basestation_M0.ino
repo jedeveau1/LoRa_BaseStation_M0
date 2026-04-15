@@ -137,6 +137,8 @@ int radio_channel;
 //max altitude indicator
 int max_altitude = 0;
 
+static bool usingLKG; // Last-Known-Good position indicator
+
 void setup() {
   pinMode(LED, OUTPUT);
   pinMode(RFM95_RST, OUTPUT);
@@ -411,11 +413,13 @@ void loop() {
     //radioBuf[inIndex] = 0; // put a null delimiter on string
     gps_len = inIndex;
     if(!strncmp((const char *) &radioBuf[3], "GGA",3)){
+/*
 #ifdef SERIAL_CONSOLE
       Serial.write(radioBuf,inIndex);
       Serial.print(" ");
       Serial.println(display_mode);
 #endif
+*/
       // Now update display
       smartDelay(500, 1);
       if(gpsBS.sentencesWithFix()){ //[v1.35]
@@ -454,6 +458,7 @@ void loop() {
  *  Display the appropriate menu or display
  *  
  */
+
 static void updateDisplay(int display)
 {
   TinyGPSPlus *pGPS; 
